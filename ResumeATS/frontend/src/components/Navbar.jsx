@@ -85,12 +85,28 @@ export default function Navbar() {
           Analyze
         </Link>
         <Link 
-          to="/contact" 
-          style={getLinkStyle("/contact")}
+          to="/jd-match" 
+          style={getLinkStyle("/jd-match")}
           onMouseEnter={handleMouseEnter}
-          onMouseLeave={(e) => handleMouseLeave(e, "/contact")}
+          onMouseLeave={(e) => handleMouseLeave(e, "/jd-match")}
         >
-          Contact Us
+          JD Match
+        </Link>
+        <Link 
+          to="/rewriter" 
+          style={getLinkStyle("/rewriter")}
+          onMouseEnter={handleMouseEnter}
+          onMouseLeave={(e) => handleMouseLeave(e, "/rewriter")}
+        >
+          Rewriter
+        </Link>
+        <Link 
+          to="/converter" 
+          style={getLinkStyle("/converter")}
+          onMouseEnter={handleMouseEnter}
+          onMouseLeave={(e) => handleMouseLeave(e, "/converter")}
+        >
+          Converter
         </Link>
       </div>
     </nav>
