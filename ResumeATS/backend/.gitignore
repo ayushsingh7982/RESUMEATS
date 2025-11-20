@@ -8,6 +8,7 @@ logs/
 # Uploads directory (keep folder, ignore files)
 uploads/*
 !uploads/.gitkeep
+faiss_indexes/
 
 # Python cache
 __pycache__/

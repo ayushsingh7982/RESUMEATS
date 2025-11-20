@@ -1,12 +1,19 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 from openai import OpenAI
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.enums import TA_LEFT
 import json
 import os
 import logging
 from datetime import datetime
+from typing import Optional
 
 # Configure logging with date-based log files
 log_dir = "logs"
@@ -50,21 +57,30 @@ async def root():
     return {
         "status": "running",
         "message": "Resume ATS Analyzer API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
-            "analyze": "POST /analyze - Upload PDF resume for analysis"
+            "analyze": "POST /analyze - Upload PDF resume for analysis",
+            "compare_jd": "POST /compare-jd - Compare resume with job description",
+            "rewrite_suggestions": "POST /rewrite-suggestions - Get resume rewriting suggestions",
+            "convert_format": "POST /convert-format - Convert resume to different formats"
         }
     }
 
-# Initialize OpenAI
+# Initialize OpenAI and RAG Engine
 api_key = os.getenv("OPENAI_API_KEY")
 if api_key:
     logger.info("OpenAI API key found, configuring client...")
     client = OpenAI(api_key=api_key)
     logger.info("OpenAI client initialized successfully")
+    
+    # Initialize RAG Engine
+    from rag_engine import RAGEngine
+    rag_engine = RAGEngine(api_key=api_key)
+    logger.info("RAG Engine initialized successfully")
 else:
     logger.warning("OpenAI API key not found in environment variables")
     client = None
+    rag_engine = None
 
 def analyze_with_openai(resume_text: str) -> dict:
     """Use OpenAI to analyze resume and provide suggestions"""
@@ -235,3 +251,557 @@ async def analyze_resume(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     
     # Note: Files are NOT automatically deleted. Run cleanup.py to remove old uploads.
+
+@app.post("/analyze-rag")
+async def analyze_resume_with_rag(file: UploadFile = File(...)):
+    """
+    RAG-based resume analysis - uses vector retrieval for grounded analysis
+    """
+    request_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    logger.info(f"[{request_id}] RAG-based resume analysis request received")
+    logger.info(f"[{request_id}] Filename: {file.filename}")
+    
+    if not file.filename.endswith('.pdf'):
+        logger.warning(f"[{request_id}] Invalid file type: {file.filename}")
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    if not rag_engine:
+        logger.error(f"[{request_id}] RAG Engine not initialized")
+        raise HTTPException(status_code=500, detail="RAG Engine not configured")
+    
+    logger.info(f"[{request_id}] Reading file contents...")
+    contents = await file.read()
+    logger.info(f"[{request_id}] File size: {len(contents)} bytes")
+
+    # Save PDF temporarily
+    os.makedirs("uploads", exist_ok=True)
+    path = f"uploads/{file.filename}"
+    logger.info(f"[{request_id}] Saving file to: {path}")
+    
+    with open(path, "wb") as f:
+        f.write(contents)
+    logger.info(f"[{request_id}] File saved successfully")
+
+    try:
+        # Read text from PDF
+        logger.info(f"[{request_id}] Extracting text from PDF...")
+        reader = PdfReader(path)
+        logger.info(f"[{request_id}] PDF has {len(reader.pages)} pages")
+        
+        text = ""
+        for i, page in enumerate(reader.pages):
+            logger.debug(f"[{request_id}] Extracting text from page {i+1}")
+            text += page.extract_text()
+        
+        logger.info(f"[{request_id}] Text extraction complete. Total characters: {len(text)}")
+
+        if not text.strip():
+            logger.error(f"[{request_id}] No text could be extracted from PDF")
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+
+        # Get RAG-based analysis with FAISS
+        logger.info(f"[{request_id}] Starting RAG-based analysis with FAISS...")
+        index_name = f"resume_{request_id}"
+        rag_analysis = rag_engine.analyze_with_rag_faiss(text, index_name=index_name)
+        logger.info(f"[{request_id}] RAG analysis completed successfully")
+        logger.info(f"[{request_id}] FAISS index saved: {index_name}")
+
+        # Basic metrics
+        basic_metrics = {
+            "word_count": len(text.split()),
+            "page_count": len(reader.pages),
+            "character_count": len(text)
+        }
+        logger.info(f"[{request_id}] Basic metrics calculated: {basic_metrics}")
+
+        response_data = {
+            "filename": file.filename,
+            "basic_metrics": basic_metrics,
+            "ai_analysis": rag_analysis,
+            "text_preview": text[:500],
+            "analysis_method": "RAG (Retrieval-Augmented Generation)"
+        }
+        
+        logger.info(f"[{request_id}] RAG Analysis Score: {rag_analysis.get('ats_score', 'N/A')}")
+        logger.info(f"[{request_id}] Request completed successfully")
+        return response_data
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Unexpected error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/compare-jd-rag")
+async def compare_with_job_description_rag(
+    file: UploadFile = File(...),
+    job_description: str = Form(...)
+):
+    """
+    RAG-based JD comparison - uses vector retrieval for accurate matching
+    """
+    request_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    logger.info(f"[{request_id}] RAG-based JD comparison request received")
+    
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    if not rag_engine:
+        raise HTTPException(status_code=500, detail="RAG Engine not configured")
+    
+    contents = await file.read()
+    os.makedirs("uploads", exist_ok=True)
+    path = f"uploads/{file.filename}"
+    
+    with open(path, "wb") as f:
+        f.write(contents)
+    
+    try:
+        reader = PdfReader(path)
+        resume_text = ""
+        for page in reader.pages:
+            resume_text += page.extract_text()
+        
+        if not resume_text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+        
+        logger.info(f"[{request_id}] Starting RAG-based JD comparison with FAISS...")
+        
+        # Use RAG engine with FAISS for grounded analysis
+        index_name = f"jd_comparison_{request_id}"
+        rag_analysis = rag_engine.analyze_with_rag_faiss(resume_text, job_description, index_name=index_name)
+        
+        logger.info(f"[{request_id}] RAG-based JD comparison completed")
+        logger.info(f"[{request_id}] FAISS index saved: {index_name}")
+        
+        return {
+            "filename": file.filename,
+            "jd_comparison": rag_analysis,
+            "analysis_method": "RAG (Retrieval-Augmented Generation)"
+        }
+        
+    except Exception as e:
+        logger.error(f"[{request_id}] Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/compare-jd")
+async def compare_with_job_description(
+    file: UploadFile = File(...),
+    job_description: str = Form(...)
+):
+    """Compare resume with job description for ATS matching"""
+    request_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    logger.info(f"[{request_id}] JD comparison request received")
+    
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    
+    contents = await file.read()
+    os.makedirs("uploads", exist_ok=True)
+    path = f"uploads/{file.filename}"
+    
+    with open(path, "wb") as f:
+        f.write(contents)
+    
+    try:
+        reader = PdfReader(path)
+        resume_text = ""
+        for page in reader.pages:
+            resume_text += page.extract_text()
+        
+        if not resume_text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+        
+        logger.info(f"[{request_id}] Comparing resume with JD...")
+        
+        prompt = f"""You are an expert ATS system. Compare this resume against the job description and provide a detailed match analysis in JSON format.
+
+Job Description:
+{job_description}
+
+Resume:
+{resume_text}
+
+Return JSON with these exact keys:
+{{
+  "overall_match_score": 85,
+  "skill_match_percentage": 78,
+  "matched_skills": ["Python", "React", "AWS"],
+  "missing_skills": ["Kubernetes", "Docker"],
+  "matched_keywords": ["leadership", "agile", "team collaboration"],
+  "missing_keywords": ["scrum master", "CI/CD"],
+  "good_to_have_keywords": ["machine learning", "data analysis"],
+  "experience_match": "Strong match - 5 years experience aligns with 3-5 years requirement",
+  "education_match": "Perfect match - Bachelor's in Computer Science",
+  "strengths_for_role": [
+    "Strong technical background in required technologies",
+    "Proven leadership experience",
+    "Relevant industry experience"
+  ],
+  "gaps_for_role": [
+    "Missing DevOps experience",
+    "No mention of Agile certifications",
+    "Limited cloud architecture experience"
+  ],
+  "recommendations": [
+    "Add Docker and Kubernetes projects to demonstrate containerization skills",
+    "Highlight any Agile/Scrum experience more prominently",
+    "Include specific metrics for team leadership achievements"
+  ],
+  "ats_compatibility": "High - Resume contains 78% of required keywords",
+  "role_fit_summary": "Strong candidate with most required skills. Adding DevOps experience would make this an excellent match."
+}}
+
+Be specific and actionable. Return ONLY valid JSON."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an expert ATS system analyzer."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        
+        analysis = json.loads(response.choices[0].message.content)
+        logger.info(f"[{request_id}] JD comparison completed")
+        
+        return {
+            "filename": file.filename,
+            "jd_comparison": analysis
+        }
+        
+    except Exception as e:
+        logger.error(f"[{request_id}] Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/rewrite-suggestions")
+async def get_rewrite_suggestions(file: UploadFile = File(...)):
+    """Generate resume rewriting suggestions using STAR method"""
+    request_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    logger.info(f"[{request_id}] Rewrite suggestions request received")
+    
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    
+    contents = await file.read()
+    os.makedirs("uploads", exist_ok=True)
+    path = f"uploads/{file.filename}"
+    
+    with open(path, "wb") as f:
+        f.write(contents)
+    
+    try:
+        reader = PdfReader(path)
+        resume_text = ""
+        for page in reader.pages:
+            resume_text += page.extract_text()
+        
+        if not resume_text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+        
+        logger.info(f"[{request_id}] Generating rewrite suggestions...")
+        
+        prompt = f"""You are an expert resume writer. Analyze this resume and provide comprehensive rewriting suggestions using the STAR method (Situation, Task, Action, Result).
+
+Resume:
+{resume_text}
+
+Return JSON with these exact keys:
+{{
+  "improved_summary": "A compelling 3-4 sentence professional summary that highlights key achievements and value proposition",
+  "rewritten_bullets": [
+    {{
+      "original": "Original bullet point from resume",
+      "improved": "Rewritten using STAR method with quantifiable results",
+      "explanation": "Why this is better"
+    }},
+    {{
+      "original": "Another original bullet",
+      "improved": "Improved version with metrics and impact",
+      "explanation": "Improvement rationale"
+    }}
+  ],
+  "keyword_insertions": [
+    {{
+      "section": "Work Experience",
+      "suggestion": "Add 'Agile methodology' when describing project management",
+      "keywords": ["Agile", "Scrum", "Sprint Planning"]
+    }},
+    {{
+      "section": "Skills",
+      "suggestion": "Include cloud platforms explicitly",
+      "keywords": ["AWS", "Azure", "GCP"]
+    }}
+  ],
+  "achievement_enhancements": [
+    "Transform 'Managed team' into 'Led cross-functional team of 8 engineers, delivering 15+ features and improving deployment speed by 40%'",
+    "Change 'Improved performance' to 'Optimized database queries reducing load time by 60% and saving $50K annually in server costs'",
+    "Upgrade 'Worked on projects' to 'Spearheaded 3 high-impact projects generating $2M in revenue and 25% user growth'"
+  ],
+  "action_verb_suggestions": [
+    "Replace 'Responsible for' with 'Orchestrated', 'Spearheaded', or 'Championed'",
+    "Change 'Helped with' to 'Collaborated on', 'Contributed to', or 'Facilitated'",
+    "Upgrade 'Did' to 'Executed', 'Implemented', or 'Delivered'"
+  ],
+  "formatting_tips": [
+    "Use consistent bullet point style throughout",
+    "Lead each bullet with a strong action verb",
+    "Include metrics and percentages where possible",
+    "Keep bullets to 1-2 lines maximum"
+  ]
+}}
+
+Be specific with examples from the actual resume. Return ONLY valid JSON."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an expert resume writer specializing in STAR method and achievement-focused writing."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        
+        suggestions = json.loads(response.choices[0].message.content)
+        logger.info(f"[{request_id}] Rewrite suggestions generated")
+        
+        return {
+            "filename": file.filename,
+            "rewrite_suggestions": suggestions
+        }
+        
+    except Exception as e:
+        logger.error(f"[{request_id}] Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/convert-format")
+async def convert_resume_format(
+    file: UploadFile = File(...),
+    format_type: str = Form(...)
+):
+    """Convert resume to different formats (ATS-optimized, HR-friendly, role-specific)"""
+    request_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    logger.info(f"[{request_id}] Format conversion request: {format_type}")
+    
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    
+    valid_formats = ["ats-optimized", "hr-friendly", "software-engineer", "data-analyst", "product-manager", "marketing"]
+    if format_type not in valid_formats:
+        raise HTTPException(status_code=400, detail=f"Invalid format. Choose from: {', '.join(valid_formats)}")
+    
+    contents = await file.read()
+    os.makedirs("uploads", exist_ok=True)
+    path = f"uploads/{file.filename}"
+    
+    with open(path, "wb") as f:
+        f.write(contents)
+    
+    try:
+        reader = PdfReader(path)
+        resume_text = ""
+        for page in reader.pages:
+            resume_text += page.extract_text()
+        
+        if not resume_text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+        
+        logger.info(f"[{request_id}] Converting to {format_type} format...")
+        
+        format_instructions = {
+            "ats-optimized": "Create an ATS-optimized version with maximum keyword density, simple formatting, and clear section headers. Focus on machine readability.",
+            "hr-friendly": "Create an HR-friendly version that's easy to skim, highlights soft skills and cultural fit, uses engaging language.",
+            "software-engineer": "Tailor for Software Engineer roles emphasizing technical skills, programming languages, system design, and engineering achievements.",
+            "data-analyst": "Tailor for Data Analyst roles emphasizing data analysis, SQL, Python, visualization tools, and data-driven insights.",
+            "product-manager": "Tailor for Product Manager roles emphasizing product strategy, stakeholder management, roadmap planning, and business impact.",
+            "marketing": "Tailor for Marketing roles emphasizing campaign management, analytics, content strategy, and growth metrics."
+        }
+        
+        prompt = f"""You are an expert resume writer. Convert this resume to a {format_type} format.
+
+Instructions: {format_instructions[format_type]}
+
+Original Resume:
+{resume_text}
+
+Return JSON with these exact keys:
+{{
+  "formatted_resume": {{
+    "summary": "Rewritten professional summary for this format",
+    "experience": [
+      {{
+        "title": "Job Title",
+        "company": "Company Name",
+        "duration": "Jan 2020 - Present",
+        "bullets": [
+          "Rewritten bullet point 1 optimized for {format_type}",
+          "Rewritten bullet point 2 with relevant keywords",
+          "Rewritten bullet point 3 with impact metrics"
+        ]
+      }}
+    ],
+    "skills": ["Skill 1", "Skill 2", "Skill 3"],
+    "education": [
+      {{
+        "degree": "Degree Name",
+        "institution": "University Name",
+        "year": "2020"
+      }}
+    ]
+  }},
+  "key_changes": [
+    "Added 15 ATS-friendly keywords",
+    "Restructured experience section for better readability",
+    "Enhanced technical skills section"
+  ],
+  "optimization_notes": "Brief explanation of how this version is optimized for {format_type}"
+}}
+
+Return ONLY valid JSON."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": f"You are an expert resume writer specializing in {format_type} resumes."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        
+        converted = json.loads(response.choices[0].message.content)
+        logger.info(f"[{request_id}] Format conversion completed")
+        
+        # Generate PDF
+        output_dir = "generated"
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = f"{format_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # Create PDF
+        doc = SimpleDocTemplate(output_path, pagesize=letter)
+        story = []
+        styles = getSampleStyleSheet()
+        
+        # Add content
+        formatted_data = converted["formatted_resume"]
+        
+        # Summary
+        story.append(Paragraph(f"<b>Professional Summary</b>", styles['Heading2']))
+        story.append(Spacer(1, 0.1*inch))
+        story.append(Paragraph(formatted_data["summary"], styles['Normal']))
+        story.append(Spacer(1, 0.2*inch))
+        
+        # Experience
+        story.append(Paragraph(f"<b>Experience</b>", styles['Heading2']))
+        story.append(Spacer(1, 0.1*inch))
+        for exp in formatted_data.get("experience", []):
+            story.append(Paragraph(f"<b>{exp['title']}</b> - {exp['company']}", styles['Heading3']))
+            story.append(Paragraph(exp['duration'], styles['Normal']))
+            for bullet in exp.get('bullets', []):
+                story.append(Paragraph(f"• {bullet}", styles['Normal']))
+            story.append(Spacer(1, 0.1*inch))
+        
+        # Skills
+        if formatted_data.get("skills"):
+            story.append(Spacer(1, 0.2*inch))
+            story.append(Paragraph(f"<b>Skills</b>", styles['Heading2']))
+            story.append(Spacer(1, 0.1*inch))
+            story.append(Paragraph(", ".join(formatted_data["skills"]), styles['Normal']))
+        
+        doc.build(story)
+        logger.info(f"[{request_id}] PDF generated: {output_path}")
+        
+        return {
+            "filename": file.filename,
+            "format_type": format_type,
+            "converted_resume": converted,
+            "download_url": f"/download/{output_filename}"
+        }
+        
+    except Exception as e:
+        logger.error(f"[{request_id}] Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    """Download generated resume file"""
+    file_path = os.path.join("generated", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, media_type="application/pdf", filename=filename)
+
+@app.get("/faiss-indexes")
+async def list_faiss_indexes():
+    """List all saved FAISS indexes"""
+    if not rag_engine:
+        raise HTTPException(status_code=500, detail="RAG Engine not configured")
+    
+    try:
+        indexes = rag_engine.list_saved_indexes()
+        return {
+            "total_indexes": len(indexes),
+            "indexes": indexes
+        }
+    except Exception as e:
+        logger.error(f"Error listing indexes: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/faiss-indexes/{index_name}")
+async def delete_faiss_index(index_name: str):
+    """Delete a specific FAISS index"""
+    if not rag_engine:
+        raise HTTPException(status_code=500, detail="RAG Engine not configured")
+    
+    try:
+        success = rag_engine.delete_index(index_name)
+        if success:
+            return {"message": f"Index '{index_name}' deleted successfully"}
+        else:
+            raise HTTPException(status_code=404, detail=f"Index '{index_name}' not found")
+    except Exception as e:
+        logger.error(f"Error deleting index: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/faiss-indexes/cleanup")
+async def cleanup_old_indexes(days_old: int = 7):
+    """Clean up FAISS indexes older than specified days"""
+    if not rag_engine:
+        raise HTTPException(status_code=500, detail="RAG Engine not configured")
+    
+    try:
+        from datetime import timedelta
+        
+        indexes = rag_engine.list_saved_indexes()
+        deleted_count = 0
+        cutoff_date = datetime.now() - timedelta(days=days_old)
+        
+        for index in indexes:
+            try:
+                created_at = datetime.fromisoformat(index['created_at'])
+                if created_at < cutoff_date:
+                    if rag_engine.delete_index(index['name']):
+                        deleted_count += 1
+            except Exception as e:
+                logger.warning(f"Error processing index {index['name']}: {e}")
+        
+        return {
+            "message": f"Cleaned up {deleted_count} old indexes",
+            "deleted_count": deleted_count,
+            "remaining_indexes": len(indexes) - deleted_count
+        }
+    except Exception as e:
+        logger.error(f"Error cleaning up indexes: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
